@@ -37,8 +37,9 @@ async function demoV4Features() {
       level: 'info'
     },
     retry: {
-      maxRetries: 3,
-      retryDelay: 300,
+      retryStrategy: 'exponential',
+      retryMaxAttempts: 3,
+      retryInitialDelay: 300,
       useJitter: true,
       retryStatusCodes: [408, 429, 500, 502, 503, 504]
     },

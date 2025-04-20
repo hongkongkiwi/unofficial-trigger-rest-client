@@ -103,10 +103,10 @@ export interface Logger {
 
 // WebSocket interfaces
 export interface WebSocketLike {
-  onopen: ((event: any) => void) | null;
-  onclose: ((event: any) => void) | null;
-  onmessage: ((event: any) => void) | null;
-  onerror: ((event: any) => void) | null;
+  onopen: ((event: Event) => void) | null;
+  onclose: ((event: CloseEvent) => void) | null;
+  onmessage: ((event: MessageEvent) => void) | null;
+  onerror: ((event: Event) => void) | null;
   close(): void;
   send(data: string): void;
 }
@@ -176,3 +176,16 @@ export type WebSocketIncomingMessage =
   | WebSocketPongMessage
   | WebSocketAuthResponseMessage
   | WebSocketUpdateMessage; 
+
+// Add WebSocket type definitions if not available in environment
+export declare const WebSocket: {
+  new (url: string): WebSocketLike;
+  prototype: WebSocketLike;
+};
+
+export interface CloseEvent extends Event {
+  code: number;
+  reason: string;
+  wasClean: boolean;
+}
+

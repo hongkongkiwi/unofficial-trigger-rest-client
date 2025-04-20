@@ -1,8 +1,8 @@
 import { AxiosInstance, AxiosRequestConfig, CancelToken } from 'axios';
-import { BatchTriggerParams, TriggerTaskParams } from '../schemas';
+import { BatchTriggerParams, TriggerTaskParams, ListParams } from '../schemas';
 import { Logger, RunDetails } from '../types';
 import { validateWithZod } from '../utils';
-import { triggerTaskParamsSchema, batchTriggerParamsSchema } from '../schemas';
+import { triggerTaskParamsSchema, batchTriggerParamsSchema, listParamsSchema } from '../schemas';
 
 /**
  * TasksAPI - Manages task-related operations
@@ -14,6 +14,31 @@ export class TasksAPI {
   constructor(client: AxiosInstance, logger: Logger) {
     this.client = client;
     this.logger = logger;
+  }
+
+  /**
+   * List tasks with pagination
+   * @param params - List parameters (limit, cursor)
+   * @param options - Request options
+   * @returns {Promise<{ data: any[], pagination: { cursor?: string } }>} - List of tasks with pagination info
+   */
+  async list(params?: ListParams, options?: {
+    cancelToken?: CancelToken,
+    requestConfig?: AxiosRequestConfig
+  }): Promise<{ data: any[], pagination: { cursor?: string } }> {
+    if (params) {
+      validateWithZod(listParamsSchema, params);
+    }
+    
+    this.logger.debug('Listing tasks', params || {});
+    
+    const response = await this.client.get('/tasks', {
+      params,
+      cancelToken: options?.cancelToken,
+      ...options?.requestConfig
+    });
+    
+    return response.data;
   }
 
   /**

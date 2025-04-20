@@ -6,7 +6,9 @@ import { webSocketManagerOptionsSchema } from './schemas';
 import {
   WebSocketLike,
   WebSocketOutgoingMessage,
-  WebSocketIncomingMessage
+  WebSocketIncomingMessage,
+  CloseEvent,
+  WebSocket
 } from './types';
 
 /**
@@ -109,7 +111,7 @@ export class WebSocketManager {
         this.setConnectionTimeout(reject);
         
         // Setup event handlers
-        ws.onopen = (event) => {
+        ws.onopen = (event: Event) => {
           this.clearConnectionTimeout();
           this.logger.debug('WebSocket connection opened');
           this._isConnected = true;
@@ -132,7 +134,7 @@ export class WebSocketManager {
           resolve();
         };
         
-        ws.onclose = (event) => {
+        ws.onclose = (event: CloseEvent) => {
           this.clearConnectionTimeout();
           this.stopHeartbeat();
           this.logger.debug('WebSocket connection closed', event);
@@ -143,7 +145,7 @@ export class WebSocketManager {
           this.reconnect();
         };
         
-        ws.onerror = (event) => {
+        ws.onerror = (event: Event) => {
           this.logger.error('WebSocket error', event);
           this.isConnecting = false;
           
@@ -153,7 +155,7 @@ export class WebSocketManager {
           }
         };
         
-        ws.onmessage = (event) => {
+        ws.onmessage = (event: MessageEvent) => {
           try {
             const data = JSON.parse(event.data);
             this.handleMessage(data);

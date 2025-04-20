@@ -43,8 +43,9 @@ const DEFAULT_OPTIONS: TriggerAPIOptions = {
     level: 'error'
   },
   retry: {
-    maxRetries: 3,
-    retryDelay: 300,
+    retryStrategy: 'exponential',
+    retryInitialDelay: 300,
+    retryMaxAttempts: 3,
     retryStatusCodes: [408, 429, 500, 502, 503, 504],
     useJitter: true
   },
@@ -321,10 +322,57 @@ export class TriggerAPI {
    * Set up automatic retry with configurable options
    */
   private setupRetry(): void {
-    // Retry setup implementation
     const retryConfig = this.options.retry || DEFAULT_OPTIONS.retry!;
+    const maxAttempts = retryConfig.retryMaxAttempts ?? 3;
+    const initialDelay = retryConfig.retryInitialDelay ?? 300;
+    const strategy = retryConfig.retryStrategy ?? 'exponential';
+    const statusCodes = retryConfig.retryStatusCodes ?? [408, 429, 500, 502, 503, 504];
+    const useJitter = retryConfig.useJitter ?? true;
+    const multiplier = retryConfig.retryMultiplier ?? 2;
     
-    // Implementation will need to be completed
+    // Add retry interceptor
+    this.client.interceptors.response.use(undefined, async (error) => {
+      if (!error.config) {
+        return Promise.reject(error);
+      }
+
+      // Get retry attempt from config or initialize
+      const retryAttempt = error.config.__retryAttempt || 0;
+      
+      // Check if we should retry
+      if (
+        retryAttempt >= maxAttempts ||
+        !statusCodes.includes(error.response?.status || 0)
+      ) {
+        return Promise.reject(error);
+      }
+
+      // Calculate delay with exponential backoff or linear strategy
+      let delay = initialDelay;
+      if (strategy === 'exponential') {
+        delay = delay * Math.pow(multiplier, retryAttempt);
+      } else {
+        // Linear strategy
+        delay = delay * (retryAttempt + 1);
+      }
+
+      // Add jitter if enabled
+      if (useJitter) {
+        delay = delay * (0.5 + Math.random());
+      }
+
+      // Log retry attempt
+      this.logger.debug(`Retrying request (attempt ${retryAttempt + 1}/${maxAttempts}) after ${delay}ms`);
+
+      // Wait for delay
+      await new Promise(resolve => setTimeout(resolve, delay));
+
+      // Update retry attempt count
+      error.config.__retryAttempt = retryAttempt + 1;
+
+      // Retry request
+      return this.client.request(error.config);
+    });
   }
 
   /**

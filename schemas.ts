@@ -3,28 +3,6 @@ import { ApiError } from './errors';
 import { Logger } from './types';
 import { AxiosInstance } from 'axios';
 
-// Add the WebSocket type definition for Node.js
-declare global {
-  interface Window {
-    WebSocket: WebSocket;
-  }
-  
-  // Simplified WebSocket type for Node.js environments
-  interface WebSocket {
-    onopen: ((event: any) => void) | null;
-    onclose: ((event: any) => void) | null;
-    onmessage: ((event: any) => void) | null;
-    onerror: ((event: any) => void) | null;
-    close(): void;
-    send(data: string): void;
-  }
-  
-  var WebSocket: {
-    prototype: WebSocket;
-    new(url: string, protocols?: string | string[]): WebSocket;
-  };
-}
-
 /**
  * Machine size presets
  */
@@ -75,20 +53,59 @@ export type SortDirection = z.infer<typeof sortDirectionSchema>;
  * Run options schema
  */
 export const runOptionsSchema = z.object({
-  idempotencyKey: z.string().optional(),
-  metadata: z.record(z.unknown()).optional(),
-  delayUntil: z.union([z.string(), z.date()]).optional(),
-  machine: machineSizeSchema.optional(),
-  tags: z.array(z.string()).optional(),
-  ttl: z.union([z.string(), z.number()]).optional(),
-  maxDuration: z.number().int().positive().optional(),
-  version: z.string().optional(),
-  releaseConcurrency: z.boolean().optional(),
-  batchKey: z.string().optional(),
-  startAfter: z.union([z.string(), z.date()]).optional(),
-  deduplicate: z.boolean().optional(),
-  queue: z.string().optional(),
-  priority: z.number().int().optional()
+  idempotencyKey: z.union([z.string(), z.array(z.string())]).optional()
+    .describe("A unique key or array of strings to ensure the task is only triggered once per key"),
+  
+  idempotencyKeyTTL: z.string().optional()
+    .describe("Time-to-live for the idempotency key (e.g., '1h', '30m')"),
+  
+  maxAttempts: z.number().int().positive().optional()
+    .describe("Maximum number of attempts including retries"),
+  
+  queue: z.string().optional()
+    .describe("Name of the predefined queue to use"),
+  
+  priority: z.number().int().nonnegative().optional()
+    .describe("Priority value in seconds, offsetting the timestamp in the queue"),
+  
+  delay: z.union([z.string(), z.date()]).optional()
+    .describe("Delay before task execution (e.g., '1h', '30m' or Date)"),
+  
+  tags: z.array(z.string().max(128)).max(10).optional()
+    .describe("Up to 10 tags for filtering runs"),
+  
+  metadata: z.record(z.unknown()).optional()
+    .describe("Additional metadata for the task run"),
+  
+  maxDuration: z.number().int().min(5).optional()
+    .describe("Maximum compute-time duration in seconds"),
+  
+  machine: machineSizeSchema.optional()
+    .describe("Machine preset name for the task run"),
+  
+  version: z.string().optional()
+    .describe("Specific version of the task to run"),
+  
+  releaseConcurrency: z.boolean().optional()
+    .describe("Whether to release concurrency when the task enters a wait state"),
+
+  startAfter: z.union([z.string(), z.date()]).optional()
+    .describe("Delay task start until after this time"),
+
+  retryStrategy: z.enum(["exponential", "linear"]).optional()
+    .describe("Strategy for calculating retry delays"),
+
+  retryDelay: z.number().int().positive().optional()
+    .describe("Base delay between retries in seconds"),
+
+  retryMultiplier: z.number().positive().optional()
+    .describe("Multiplier for exponential backoff"),
+
+  retryMaxAttempts: z.number().int().positive().optional()
+    .describe("Maximum number of retry attempts"),
+
+  retryInitialDelay: z.number().int().positive().optional()
+    .describe("Initial delay before first retry in seconds")
 });
 
 export type RunOptions = z.infer<typeof runOptionsSchema>;
@@ -245,10 +262,20 @@ export type PerformanceMetricsOptions = z.infer<typeof performanceMetricsOptions
  * Retry options schema
  */
 export const retryOptionsSchema = z.object({
-  maxRetries: z.number().int().nonnegative().optional(),
-  retryDelay: z.number().int().positive().optional(),
-  retryStatusCodes: z.array(z.number().int()).optional(),
+  retryStrategy: z.enum(["exponential", "linear"]).optional()
+    .describe("Strategy for calculating retry delays"),
+  retryDelay: z.number().int().positive().optional()
+    .describe("Base delay between retries in seconds"),
+  retryMultiplier: z.number().positive().optional()
+    .describe("Multiplier for exponential backoff"),
+  retryMaxAttempts: z.number().int().positive().optional()
+    .describe("Maximum number of retry attempts"),
+  retryInitialDelay: z.number().int().positive().optional()
+    .describe("Initial delay before first retry in seconds"),
+  retryStatusCodes: z.array(z.number().int()).optional()
+    .describe("HTTP status codes to retry on"),
   useJitter: z.boolean().optional()
+    .describe("Whether to add random jitter to retry delays")
 });
 
 export type RetryOptions = z.infer<typeof retryOptionsSchema>;

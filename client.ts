@@ -59,8 +59,11 @@ const DEFAULT_OPTIONS: TriggerAPIOptions = {
     level: 'error'
   },
   retry: {
-    maxRetries: 3,
-    retryDelay: 300,
+    retryStrategy: "exponential",
+    retryDelay: 1,
+    retryMultiplier: 2,
+    retryMaxAttempts: 3,
+    retryInitialDelay: 1,
     retryStatusCodes: [408, 429, 500, 502, 503, 504],
     useJitter: true
   },
@@ -494,13 +497,14 @@ export class TriggerAPI {
    * @returns The interceptor ID for later removal if needed
    */
   private configureRetryLogic(options: {
-    maxRetries: number;
+    retryStrategy: "exponential" | "linear";
     retryDelay: number;
+    retryMultiplier: number;
+    retryMaxAttempts: number;
+    retryInitialDelay: number;
     retryStatusCodes: number[];
     useJitter?: boolean;
-  }): number {
-    const { maxRetries, retryDelay, retryStatusCodes, useJitter } = options;
-    
+  }) {
     return this.client.interceptors.response.use(undefined, async (error: AxiosError) => {
       const config = error.config;
       if (!config) return Promise.reject(error);
@@ -510,25 +514,35 @@ export class TriggerAPI {
       retryState._retryCount = retryState._retryCount || 0;
       
       // Check if we should retry the request
-      if (retryState._retryCount >= maxRetries) {
+      if (retryState._retryCount >= options.retryMaxAttempts) {
         return Promise.reject(error);
       }
-      
+
       const status = error.response?.status;
-      if (!status || !retryStatusCodes.includes(status)) {
+      if (!status || !options.retryStatusCodes.includes(status)) {
         return Promise.reject(error);
       }
       
-      // Retry with exponential backoff and jitter if enabled
+      // Increment retry count
       retryState._retryCount += 1;
-      const baseDelay = retryDelay * Math.pow(2, retryState._retryCount - 1);
+
+      // Calculate delay based on strategy
+      let delay: number;
+      if (options.retryStrategy === "exponential") {
+        delay = options.retryInitialDelay * Math.pow(options.retryMultiplier, retryState._retryCount - 1);
+      } else {
+        delay = options.retryDelay * retryState._retryCount;
+      }
+
+      // Add jitter if enabled
+      if (options.useJitter) {
+        delay = delay * (0.5 + Math.random());
+      }
+
+      // Convert to milliseconds
+      delay = delay * 1000;
       
-      // Add jitter to prevent thundering herd problem
-      const delay = useJitter !== false
-        ? baseDelay * (0.5 + Math.random() * 0.5) // 50-100% of base delay
-        : baseDelay;
-      
-      this.logger.info(`Retrying request (${retryState._retryCount}/${maxRetries}) after ${Math.round(delay)}ms`);
+      this.logger.info(`Retrying request (${retryState._retryCount}/${options.retryMaxAttempts}) after ${Math.round(delay)}ms`);
       await new Promise(resolve => setTimeout(resolve, delay));
       return this.client(config);
     });
@@ -540,8 +554,11 @@ export class TriggerAPI {
   private setupRetry(): void {
     const retryConfig = this.options.retry || DEFAULT_OPTIONS.retry!;
     this.configureRetryLogic({
-      maxRetries: retryConfig.maxRetries!,
+      retryStrategy: retryConfig.retryStrategy!,
       retryDelay: retryConfig.retryDelay!,
+      retryMultiplier: retryConfig.retryMultiplier!,
+      retryMaxAttempts: retryConfig.retryMaxAttempts!,
+      retryInitialDelay: retryConfig.retryInitialDelay!,
       retryStatusCodes: retryConfig.retryStatusCodes!,
       useJitter: retryConfig.useJitter
     });
@@ -775,9 +792,12 @@ export class TriggerAPI {
     
     // Configure new retry logic
     this.configureRetryLogic({
-      maxRetries: validatedOptions.maxRetries ?? 3,
-      retryDelay: validatedOptions.retryDelay ?? 300,
-      retryStatusCodes: validatedOptions.retryStatusCodes ?? [408, 429, 500, 502, 503, 504],
+      retryStrategy: validatedOptions.retryStrategy!,
+      retryDelay: validatedOptions.retryDelay!,
+      retryMultiplier: validatedOptions.retryMultiplier!,
+      retryMaxAttempts: validatedOptions.retryMaxAttempts!,
+      retryInitialDelay: validatedOptions.retryInitialDelay!,
+      retryStatusCodes: validatedOptions.retryStatusCodes!,
       useJitter: validatedOptions.useJitter
     });
     
