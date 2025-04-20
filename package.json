@@ -6,15 +6,20 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "trigger.dev",
+    "trigger"
+  ],
+  "author": "Andy Savage <andy@savage.hk>",
+  "license": "MIT",
   "packageManager": "pnpm@10.8.1",
   "devDependencies": {
     "@types/node": "^22.14.1",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
   },
   "dependencies": {
+    "@sentry/node": "^9.13.0",
     "axios": "^1.8.4",
     "zod": "^3.24.3",
     "zod-validation-error": "^3.4.0"
