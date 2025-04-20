@@ -1,5 +1,5 @@
 {
-  "name": "trigger-rest-client",
+  "name": "@hongkongkiwi/trigger-rest-client",
   "version": "1.0.0",
   "description": "Unofficial Trigger.dev REST API client",
   "main": "index.js",

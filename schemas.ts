@@ -1,4 +1,7 @@
 import { z } from 'zod';
+import { ApiError } from './errors';
+import { Logger } from './types';
+import { AxiosInstance } from 'axios';
 
 // Add the WebSocket type definition for Node.js
 declare global {
@@ -266,6 +269,14 @@ export const webSocketManagerOptionsSchema = z.object({
 export type WebSocketManagerOptions = z.infer<typeof webSocketManagerOptionsSchema>;
 
 /**
+ * Error hook schema
+ */
+export const errorHookSchema = z.function()
+  .args(z.custom<ApiError>())
+  .returns(z.void())
+  .optional();
+
+/**
  * API options schema
  */
 export const triggerAPIOptionsSchema = z.object({
@@ -284,7 +295,14 @@ export const triggerAPIOptionsSchema = z.object({
   retry: retryOptionsSchema.optional(),
   enableCompression: z.boolean().optional(),
   metrics: performanceMetricsOptionsSchema.optional(),
-  websocketOptions: webSocketManagerOptionsSchema.optional()
+  websocketOptions: webSocketManagerOptionsSchema.optional(),
+  errorHook: errorHookSchema,
+  axiosInstance: z.custom<any>((val) => {
+    return val !== null && 
+           typeof val === 'object' && 
+           typeof (val as any).request === 'function' &&
+           typeof (val as any).interceptors === 'object';
+  }, { message: "axiosInstance must be a valid Axios instance with request method and interceptors" }).optional()
 }).strict();
 
 export type TriggerAPIOptions = {
@@ -297,12 +315,6 @@ export type TriggerAPIOptions = {
   enableCompression?: boolean;
   metrics?: PerformanceMetricsOptions;
   websocketOptions?: WebSocketManagerOptions;
-};
-
-// Define Logger interface to avoid circular reference
-interface Logger {
-  error: (message: string, ...args: any[]) => void;
-  warn: (message: string, ...args: any[]) => void;
-  info: (message: string, ...args: any[]) => void;
-  debug: (message: string, ...args: any[]) => void;
-} 
+  errorHook?: (error: ApiError) => void;
+  axiosInstance?: AxiosInstance;  // Custom Axios instance
+}; 

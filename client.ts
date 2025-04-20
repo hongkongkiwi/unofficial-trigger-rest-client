@@ -9,7 +9,8 @@ import {
   batchTriggerParamsSchema,
   scheduleParamsSchema,
   envVarParamsSchema,
-  queueParamsSchema
+  queueParamsSchema,
+  RetryOptions
 } from './schemas';
 import { 
   Logger,
@@ -23,12 +24,28 @@ import {
   PermissionDeniedError,
   NotFoundError,
   RateLimitError,
-  ServerError
+  ServerError,
+  BadRequestError,
+  ConflictError,
+  UnprocessableEntityError,
+  InternalServerError
 } from './errors';
 import { validateWithZod } from './utils';
 import { triggerAPIOptionsSchema, retryOptionsSchema } from './schemas';
 import { WebSocketManager } from './websocket';
+import { createWait } from './modules/wait';
 import { z } from "zod";
+
+// Import API modules
+import { RunsAPI } from './modules/runs';
+import { TasksAPI } from './modules/tasks';
+import { SchedulesAPI } from './modules/schedules';
+import { CacheAPI } from './modules/cache';
+import { BatchAPI } from './modules/batch';
+import { EnvVarsAPI } from './modules/envvars';
+import { QueuesAPI } from './modules/queues';
+import { MetadataAPI } from './modules/metadata';
+import { AIAPI } from './modules/ai';
 
 /**
  * Default API options
@@ -146,6 +163,23 @@ export class TriggerAPI {
    */
   private wsManager: WebSocketManager | null = null;
 
+  // API modules
+  public runs: RunsAPI;
+  public tasks: TasksAPI;
+  public schedules: SchedulesAPI;
+  public cache: CacheAPI;
+  public batch: BatchAPI;
+  public envVars: EnvVarsAPI;
+  public queues: QueuesAPI;
+  public metadata: MetadataAPI;
+  public ai: AIAPI;
+  
+  /**
+   * Wait tokens API
+   * @v4 - New API for managing wait tokens
+   */
+  public wait: ReturnType<typeof createWait>;
+
   /**
    * Create a new TriggerAPI client
    * @param secretKey - Your Trigger.dev secret key
@@ -172,7 +206,7 @@ export class TriggerAPI {
     this.baseURL = this.options.baseURL || DEFAULT_OPTIONS.baseURL!;
     this.websocketURL = this.options.websocketURL || DEFAULT_OPTIONS.websocketURL!;
     
-    // Set up logging (use custom logger if provided, otherwise create one)
+    // Set up logging
     this.logger = this.options.logger || this.createLogger();
     
     // Headers for the client
@@ -187,11 +221,36 @@ export class TriggerAPI {
       this.logger.debug('Response compression enabled');
     }
     
+    // Use custom Axios instance if provided, otherwise create new one
+    if (this.options.axiosInstance) {
+      this.logger.debug('Using provided Axios instance');
+      this.client = this.options.axiosInstance;
+      
+      // Update the base URL if it doesn't match
+      if (this.client.defaults.baseURL !== this.baseURL) {
+        this.client.defaults.baseURL = this.baseURL;
+        this.logger.debug(`Updated Axios instance baseURL to ${this.baseURL}`);
+      }
+      
+      // Ensure authorization headers are set
+      this.client.defaults.headers.common['Authorization'] = `Bearer ${secretKey}`;
+      this.client.defaults.headers.common['Content-Type'] = 'application/json';
+      
+      // Apply timeout if specified
+      if (this.options.timeout) {
+        this.client.defaults.timeout = this.options.timeout;
+      }
+    } else {
+      // Create a new Axios instance with our configuration
     this.client = axios.create({
       baseURL: this.baseURL,
       headers,
       timeout: this.options.timeout,
     });
+    }
+
+    // Add a reference to this instance on the client for cross-module access
+    (this.client as any).__parent = this;
 
     // Add response interceptor to handle errors
     this.setupErrorHandling();
@@ -202,18 +261,62 @@ export class TriggerAPI {
     // Set up metrics collection if enabled
     this.setupMetrics();
 
-    // Bind methods that need to access 'this'
-    this.runs.poll = this.runs.poll.bind(this);
-    this.runs.subscribeToRun = this.runs.subscribeToRun.bind(this);
-    this.runs.subscribeToRunsWithTag = this.runs.subscribeToRunsWithTag.bind(this);
-    this.runs.subscribeToBatch = this.runs.subscribeToBatch.bind(this);
-    this.runs.listAll = this.runs.listAll.bind(this);
+    // Initialize API modules
+    this.runs = new RunsAPI(this.client, this.logger);
+    this.tasks = new TasksAPI(this.client, this.logger);
+    this.schedules = new SchedulesAPI(this.client, this.logger);
+    this.cache = new CacheAPI(this.client, this.logger);
+    this.batch = new BatchAPI(this.client, this.logger);
+    this.envVars = new EnvVarsAPI(this.client, this.logger);
+    this.queues = new QueuesAPI(this.client, this.logger);
+    this.metadata = new MetadataAPI(this.client, this.logger);
+    this.ai = new AIAPI(this.client, this.logger);
+    
+    // Initialize v4 modules
+    this.wait = createWait(this.client, this.logger);
+    
+    // Setup WebSocket for subscription APIs
+    this.setupWebSocket();
+  }
+  
+  /**
+   * Configuration method
+   */
+  configure(options: TriggerAPIOptions): TriggerAPI {
+    // Apply configuration options
+    if (options.baseURL) {
+      this.setBaseURL(options.baseURL);
+    }
+    
+    if (options.websocketURL) {
+      this.setWebSocketURL(options.websocketURL);
+    }
+    
+    if (options.timeout) {
+      this.setTimeout(options.timeout);
+    }
+    
+    if (options.logging) {
+      // Configure logging
+      // For now, we'll need to create a new logger
+      this.logger = this.createLogger();
+    }
+    
+    if (options.retry) {
+      this.enableRetries(options.retry);
+    }
+    
+    // Update options
+    this.options = { ...this.options, ...options };
+    
+    // Return this for method chaining
+    return this;
   }
 
   /**
    * Creates a configured logger based on options
    */
-  private createLogger() {
+  private createLogger(): Logger {
     const { enabled, level } = this.options.logging || DEFAULT_OPTIONS.logging!;
     
     const noop = () => {};
@@ -251,7 +354,7 @@ export class TriggerAPI {
   /**
    * Set up error handling interceptor
    */
-  private setupErrorHandling() {
+  private setupErrorHandling(): void {
     this.client.interceptors.response.use(
       (response: AxiosResponse) => response,
       (error: AxiosError) => {
@@ -264,6 +367,13 @@ export class TriggerAPI {
 
           // Create specific error type based on status code
           switch (status) {
+            case 400:
+              apiError = new BadRequestError(
+                `Bad request: ${errorMsg}`,
+                data, 
+                error
+              );
+              break;
             case 401:
               apiError = new AuthenticationError(
                 `Authentication failed: ${errorMsg}`, 
@@ -285,6 +395,20 @@ export class TriggerAPI {
                 error
               );
               break;
+            case 409:
+              apiError = new ConflictError(
+                `Conflict: ${errorMsg}`,
+                data,
+                error
+              );
+              break;
+            case 422:
+              apiError = new UnprocessableEntityError(
+                `Unprocessable entity: ${errorMsg}`,
+                data, 
+                error
+              );
+              break;
             case 429:
               const retryAfter = error.response.headers['retry-after'] 
                 ? parseInt(error.response.headers['retry-after'], 10) 
@@ -297,6 +421,12 @@ export class TriggerAPI {
               );
               break;
             case 500:
+              apiError = new InternalServerError(
+                `Server error: ${errorMsg}`,
+                data,
+                error
+              );
+              break;
             case 502:
             case 503:
             case 504:
@@ -318,6 +448,16 @@ export class TriggerAPI {
           }
 
           this.logger.error(`${apiError.name}: ${apiError.message}`);
+          
+          // Call the error hook if provided
+          if (this.options.errorHook) {
+            try {
+              this.options.errorHook(apiError);
+            } catch (hookError) {
+              this.logger.error(`Error in errorHook: ${hookError}`);
+            }
+          }
+          
           return Promise.reject(apiError);
         } else if (error.request) {
           const networkError = new TriggerAPIError(
@@ -327,6 +467,16 @@ export class TriggerAPI {
             error
           );
           this.logger.error(`Network Error: ${error.message}`);
+          
+          // Call the error hook for network errors if provided
+          if (this.options.errorHook) {
+            try {
+              this.options.errorHook(networkError);
+            } catch (hookError) {
+              this.logger.error(`Error in errorHook: ${hookError}`);
+            }
+          }
+          
           return Promise.reject(networkError);
         }
         
@@ -387,7 +537,7 @@ export class TriggerAPI {
   /**
    * Set up automatic retry with configurable options
    */
-  private setupRetry() {
+  private setupRetry(): void {
     const retryConfig = this.options.retry || DEFAULT_OPTIONS.retry!;
     this.configureRetryLogic({
       maxRetries: retryConfig.maxRetries!,
@@ -398,331 +548,14 @@ export class TriggerAPI {
   }
 
   /**
-   * Validate parameters for required fields and custom validation
-   * @param params - Parameters to validate
-   * @param requiredFields - Array of required field names
-   * @param customValidations - Object with custom validation functions
-   * @throws {ValidationError} - If validation fails
+   * Setup WebSocket connection for subscription APIs
    */
-  private validateParams(
-    params: unknown, 
-    requiredFields: string[] = [], 
-    customValidations?: Record<string, (val: unknown) => boolean>
-  ) {
-    if (!params || typeof params !== 'object') {
-      throw new ValidationError('Parameters must be an object');
-    }
+  private setupWebSocket(): void {
+    // Don't initialize immediately, wait until needed
+    this.wsManager = null;
     
-    const paramsObj = params as Record<string, unknown>;
-    
-    // Check required fields
-    for (const field of requiredFields) {
-      if (!(field in paramsObj) || paramsObj[field] === undefined || paramsObj[field] === null) {
-        throw new ValidationError(`Missing required parameter: ${field}`);
-      }
-    }
-    
-    // Run custom validations
-    if (customValidations) {
-      for (const [field, validator] of Object.entries(customValidations)) {
-        if (field in paramsObj && !validator(paramsObj[field])) {
-          throw new ValidationError(`Invalid value for parameter: ${field}`);
-        }
-      }
-    }
-    
-    return true;
-  }
-  
-  /**
-   * Tasks API
-   */
-  tasks = {
-    /**
-     * Trigger a task
-     * @param params - Task parameters
-     * @param options - Request options
-     * @returns {Promise<RunDetails>} - Run details
-     */
-    trigger: async (params: TriggerTaskParams, options?: {
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig
-    }): Promise<RunDetails> => {
-      validateWithZod(triggerTaskParamsSchema, params);
-      this.logger.debug('Triggering task:', params);
-      
-      const response = await this.client.post('/tasks/trigger', params, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      });
-      return response.data;
-    },
-
-    /**
-     * Batch trigger multiple tasks
-     * @param params - Batch parameters
-     * @param options - Request options
-     * @returns {Promise<RunDetails[]>} - Array of run details
-     */
-    batchTrigger: async (params: BatchTriggerParams, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig
-    }): Promise<RunDetails[]> => {
-      validateWithZod(batchTriggerParamsSchema, params);
-      this.logger.debug('Batch triggering tasks:', params);
-      
-      const response = await this.client.post('/tasks/batch-trigger', params, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      });
-      return response.data;
-    },
-    
-    /**
-     * Batch multiple task triggering requests into a single API call
-     * 
-     * This is helpful when you need to trigger many tasks in parallel
-     * 
-     * @param requests - Array of task parameters
-     * @param options - Request options
-     */
-    batchRequests: async (requests: TriggerTaskParams[], options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig
-    }) => {
-      if (!Array.isArray(requests) || requests.length === 0) {
-        throw new Error('Batch requests must be a non-empty array');
-      }
-      
-      this.logger.debug('Batching requests', requests.length);
-      return this.tasks.batchTrigger({ runs: requests }, options);
-    }
-  };
-
-  /**
-   * Runs API
-   */
-  runs = {
-    /**
-     * List runs with optional filters
-     * @param params - List parameters
-     * @param options - Request options
-     */
-    list: async (params?: ListRunsParams, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig 
-    }): Promise<PaginatedResponse<RunDetails>> => {
-      this.logger.debug('Listing runs', params);
-      return this.client.get('/runs', { 
-        params,
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      }).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Automatically fetch all pages of runs matching the filters
-     * @param params - List parameters (limit will be used per page)
-     * @param options - Request options including page limit
-     */
-    listAll: async function(this: TriggerAPI, params?: ListRunsParams, options?: { 
-      cancelToken?: CancelToken,
-      maxPages?: number,
-      onPage?: (page: RunDetails[], pageNumber: number) => void | Promise<void>
-    }): Promise<RunDetails[]> {
-      const maxPages = options?.maxPages || Infinity;
-      let currentPage = 1;
-      let allResults: RunDetails[] = [];
-      let currentParams = { ...params };
-      let hasMore = true;
-      
-      this.logger.debug('Fetching all run pages', { maxPages, params });
-      
-      while (hasMore && currentPage <= maxPages) {
-        const response: PaginatedResponse<RunDetails> = await this.runs.list(currentParams, {
-          cancelToken: options?.cancelToken
-        });
-        
-        allResults = [...allResults, ...response.data];
-        
-        if (options?.onPage) {
-          await options.onPage(response.data, currentPage);
-        }
-        
-        if (!response.pagination.hasMore || !response.pagination.cursor) {
-          hasMore = false;
-        } else {
-          currentParams = { ...currentParams, cursor: response.pagination.cursor };
-          currentPage++;
-        }
-      }
-      
-      return allResults;
-    },
-
-    /**
-     * Retrieve a specific run
-     * @param runId - The ID of the run
-     * @param options - Request options
-     */
-    retrieve: async (runId: string, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig 
-    }): Promise<RunDetails> => {
-      this.validateParams({ runId }, ['runId'], {
-        runId: val => typeof val === 'string' && val.length > 0
-      });
-      
-      this.logger.debug('Retrieving run', runId);
-      return this.client.get(`/runs/${runId}`, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      }).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Replay a run
-     * @param runId - The ID of the run to replay
-     * @param options - Request options
-     */
-    replay: async (runId: string, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig 
-    }) => {
-      this.validateParams({ runId }, ['runId'], {
-        runId: val => typeof val === 'string' && val.length > 0
-      });
-      
-      this.logger.debug('Replaying run', runId);
-      return this.client.post(`/runs/${runId}/replay`, undefined, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      }).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Cancel a run
-     * @param runId - The ID of the run to cancel
-     * @param options - Request options
-     * @returns {Promise<boolean>} - True if cancellation was successful
-     */
-    cancel: async (runId: string, options?: {
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig
-    }): Promise<boolean> => {
-      this.validateParams({ runId }, ['runId'], {
-        runId: val => typeof val === 'string' && val.length > 0
-      });
-      
-      this.logger.debug('Cancelling run:', runId);
-      
-      const response = await this.client.post(`/runs/${runId}/cancel`, undefined, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      });
-      return response.data;
-    },
-
-    /**
-     * Reschedule a run
-     * @param runId - The ID of the run to reschedule
-     * @param params - Reschedule parameters
-     * @param options - Request options
-     */
-    reschedule: async (runId: string, params: { delayUntil: string | Date }, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig 
-    }) => {
-      this.validateParams({ runId, ...params }, ['runId', 'delayUntil']);
-      
-      this.logger.debug('Rescheduling run', { runId, params });
-      return this.client.post(`/runs/${runId}/reschedule`, params, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      }).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Update run metadata
-     * @param runId - The ID of the run
-     * @param metadata - Metadata to update
-     * @param options - Request options
-     */
-    updateMetadata: async (runId: string, metadata: Record<string, unknown>, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig 
-    }) => {
-      this.validateParams({ runId }, ['runId'], {
-        runId: val => typeof val === 'string' && val.length > 0
-      });
-      
-      this.logger.debug('Updating run metadata', { runId, metadata });
-      return this.client.put(`/runs/${runId}/metadata`, { metadata }, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      }).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * @v4 - Poll a run until completion
-     * @param runId - The ID of the run
-     * @param options - Poll options
-     */
-    poll: async function(this: TriggerAPI, runId: string, options?: { 
-      pollIntervalMs?: number,
-      timeoutMs?: number,
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig
-    }): Promise<RunDetails> {
-      this.validateParams({ runId }, ['runId'], {
-        runId: val => typeof val === 'string' && val.length > 0
-      });
-      
-      const intervalMs = options?.pollIntervalMs || 1000;
-      const timeoutMs = options?.timeoutMs || 0; // 0 means no timeout
-      const client = this.client;
-      const startTime = Date.now();
-      const logger = this.logger;
-      
-      logger.debug('Polling run until completion', { runId, intervalMs, timeoutMs });
-      
-      const poll = async (): Promise<RunDetails> => {
-        // Check timeout
-        if (timeoutMs > 0 && (Date.now() - startTime) > timeoutMs) {
-          throw new Error(`Polling timed out after ${timeoutMs}ms`);
-        }
-        
-        const response = await client.get(`/runs/${runId}`, {
-          cancelToken: options?.cancelToken,
-          ...options?.requestConfig
-        });
-        const run = response.data;
-        
-        const completedStatuses = [
-          'COMPLETED', 'CANCELED', 'FAILED', 'CRASHED', 'INTERRUPTED', 
-          'SYSTEM_FAILURE', 'EXPIRED', 'TIMED_OUT'
-        ];
-        
-        if (completedStatuses.includes(run.status)) {
-          logger.debug('Run completed polling', { runId, status: run.status });
-          return run;
-        }
-        
-        logger.debug('Run not yet completed, waiting to poll again', { runId, status: run.status });
-        await new Promise(resolve => setTimeout(resolve, intervalMs));
-        return poll();
-      };
-      
-      return poll();
-    },
-
-    /**
-     * @v4 - Subscribe to run updates via WebSocket
-     * @param runId - The ID of the run
-     * @param options - Subscription options
-     */
-    subscribeToRun: async function* (this: TriggerAPI, runId: string, options?: { stopOnCompletion?: boolean }) {
-      // Initialize WebSocket manager if not already created
+    // Create wrapper methods to get WebSocket manager
+    const getWsManager = () => {
       if (!this.wsManager) {
         this.wsManager = new WebSocketManager(
           this.websocketURL, 
@@ -731,663 +564,44 @@ export class TriggerAPI {
           this.options.websocketOptions
         );
       }
-      
-      // Retrieve the initial run state to yield it immediately
-      const initialRun = await this.client.get(`/runs/${runId}`).then((res: AxiosResponse) => res.data);
-      yield initialRun;
-      
-      const stopOnCompletion = options?.stopOnCompletion ?? true;
-      
-      // If run is already completed and stopOnCompletion is true, no need to subscribe
-      if (stopOnCompletion && ['COMPLETED', 'CANCELED', 'FAILED', 'CRASHED', 
-                               'INTERRUPTED', 'SYSTEM_FAILURE', 'EXPIRED', 
-                               'TIMED_OUT'].includes(initialRun.status)) {
-        return;
-      }
-      
-      try {
-        // Create a promise that will resolve when we're done
-        const done = new Promise<void>((resolve) => {
-          let unsubscribe: (() => void) | null = null;
-          
-          try {
-            // Subscribe to run updates
-            unsubscribe = this.wsManager!.subscribe('run', runId, (data) => {
-              const run = data.run;
-              
-              // Yield the updated run
-              const yieldResult = {
-                value: run,
-                done: false
-              };
-              
-              // @ts-ignore - This is a workaround to make the generator yield within a callback
-              this.subscribeToRun.next(yieldResult);
-              
-              // If the run is completed and stopOnCompletion is true, unsubscribe
-              if (stopOnCompletion && ['COMPLETED', 'CANCELED', 'FAILED', 'CRASHED', 
-                                       'INTERRUPTED', 'SYSTEM_FAILURE', 'EXPIRED', 
-                                       'TIMED_OUT'].includes(run.status)) {
-                if (unsubscribe) {
-                  unsubscribe();
-                  unsubscribe = null;
-                }
-                resolve();
-              }
-            });
-          } catch (error) {
-            this.logger.error('Error subscribing to run updates', error);
-            if (unsubscribe) {
-              unsubscribe();
-            }
-            resolve();
-          }
-        });
-        
-        // Wait for completion
-        await done;
-      } catch (error) {
-        this.logger.error('Error in run subscription', error);
-      }
-    },
-
-    /**
-     * @v4 - Subscribe to runs with specific tags
-     * @param tag - Tag or array of tags to filter runs
-     */
-    subscribeToRunsWithTag: async function* (this: TriggerAPI, tag: string | string[]) {
-      // Initialize WebSocket manager if not already created
-      if (!this.wsManager) {
-        this.wsManager = new WebSocketManager(
-          this.websocketURL, 
-          this.apiKey, 
-          this.logger,
-          this.options.websocketOptions
-        );
-      }
-      
-      const tags = Array.isArray(tag) ? tag : [tag];
-      
-      try {
-        // Create a promise that will resolve when we're done
-        const done = new Promise<void>((resolve) => {
-          const tagSubscriptions: (() => void)[] = [];
-          
-          // Subscribe to each tag
-          for (const tagValue of tags) {
-            try {
-              const unsubscribe = this.wsManager!.subscribe('tag', tagValue, (data) => {
-                // Yield the run
-                const yieldResult = {
-                  value: data.run,
-                  done: false
-                };
-                
-                // @ts-ignore - This is a workaround to make the generator yield within a callback
-                this.subscribeToRunsWithTag.next(yieldResult);
-              });
-              
-              tagSubscriptions.push(unsubscribe);
-            } catch (error) {
-              this.logger.error(`Error subscribing to tag: ${tagValue}`, error);
-            }
-          }
-          
-          // This generator doesn't automatically resolve, it needs to be manually cleaned up
-          // by the caller when they're done with it
-        });
-        
-        // Yield initial tag subscription confirmation
-        yield { subscribed: true, tags };
-        
-        // Wait for completion (which won't happen automatically)
-        await done;
-      } catch (error) {
-        this.logger.error('Error in tag subscription', error);
-      }
-    },
-
-    /**
-     * @v4 - Subscribe to runs in a batch
-     * @param batchId - The batch ID
-     */
-    subscribeToBatch: async function* (this: TriggerAPI, batchId: string) {
-      // Initialize WebSocket manager if not already created
-      if (!this.wsManager) {
-        this.wsManager = new WebSocketManager(
-          this.websocketURL, 
-          this.apiKey, 
-          this.logger,
-          this.options.websocketOptions
-        );
-      }
-      
-      // Retrieve the initial batch state
-      const initialBatch = await this.client.get(`/batches/${batchId}`).then((res: AxiosResponse) => res.data);
-      yield initialBatch;
-      
-      try {
-        // Create a promise that will resolve when we're done
-        const done = new Promise<void>((resolve) => {
-          let unsubscribe: (() => void) | null = null;
-          
-          try {
-            // Subscribe to batch updates
-            unsubscribe = this.wsManager!.subscribe('batch', batchId, (data) => {
-              const batch = data.batch;
-              
-              // Yield the updated batch
-              const yieldResult = {
-                value: batch,
-                done: false
-              };
-              
-              // @ts-ignore - This is a workaround to make the generator yield within a callback
-              this.subscribeToBatch.next(yieldResult);
-              
-              // Check if all runs in the batch are completed
-              const allCompleted = batch.runs?.every((run: RunDetails) => 
-                ['COMPLETED', 'CANCELED', 'FAILED', 'CRASHED', 
-                'INTERRUPTED', 'SYSTEM_FAILURE', 'EXPIRED', 
-                'TIMED_OUT'].includes(run.status)
-              );
-              
-              if (allCompleted) {
-                if (unsubscribe) {
-                  unsubscribe();
-                  unsubscribe = null;
-                }
-                resolve();
-              }
-            });
-          } catch (error) {
-            this.logger.error('Error subscribing to batch updates', error);
-            if (unsubscribe) {
-              unsubscribe();
-            }
-            resolve();
-          }
-        });
-        
-        // Wait for completion
-        await done;
-      } catch (error) {
-        this.logger.error('Error in batch subscription', error);
-      }
-    },
-
-    /**
-     * @v4 - Fetch a stream from a run
-     * @param runId - The ID of the run
-     * @param streamKey - The key of the stream
-     */
-    fetchStream: async (runId: string, streamKey: string) => {
-      return this.client.get(`/runs/${runId}/streams/${streamKey}`).then((res: AxiosResponse) => res.data);
-    }
-  };
-
-  /**
-   * Schedules API
-   */
-  schedules = {
-    /**
-     * Create a schedule
-     * @param params - Schedule parameters
-     * @param options - Request options
-     */
-    create: async (params: CreateScheduleParams, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig 
-    }): Promise<ScheduleDetails> => {
-      validateWithZod(createScheduleParamsSchema, params);
-      this.logger.debug('Creating schedule', params);
-      
-      return this.client.post('/schedules', params, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      }).then((res: AxiosResponse) => res.data);
-    },
-    
-    /**
-     * List schedules with optional filters
-     * @param params - List parameters
-     * @param options - Request options
-     */
-    list: async (params?: ListSchedulesParams, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig 
-    }): Promise<PaginatedResponse<ScheduleDetails>> => {
-      this.logger.debug('Listing schedules', params);
-      
-      return this.client.get('/schedules', { 
-        params,
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      }).then((res: AxiosResponse) => res.data);
-    },
-    
-    /**
-     * Retrieve a specific schedule
-     * @param id - Schedule ID
-     * @param options - Request options
-     */
-    get: async (id: string, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig 
-    }): Promise<ScheduleDetails> => {
-      this.validateParams({ id }, ['id']);
-      this.logger.debug('Retrieving schedule', id);
-      
-      return this.client.get(`/schedules/${id}`, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      }).then((res: AxiosResponse) => res.data);
-    },
-    
-    /**
-     * Update a schedule
-     * @param id - Schedule ID
-     * @param params - Update parameters
-     * @param options - Request options
-     */
-    update: async (id: string, params: UpdateScheduleParams, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig 
-    }): Promise<ScheduleDetails> => {
-      this.validateParams({ id, ...params }, ['id']);
-      validateWithZod(updateScheduleParamsSchema, params);
-      this.logger.debug('Updating schedule', { id, params });
-      
-      return this.client.patch(`/schedules/${id}`, params, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      }).then((res: AxiosResponse) => res.data);
-    },
-    
-    /**
-     * Delete a schedule
-     * @param id - Schedule ID
-     * @param options - Request options
-     */
-    delete: async (id: string, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig 
-    }): Promise<void> => {
-      this.validateParams({ id }, ['id']);
-      this.logger.debug('Deleting schedule', id);
-      
-      return this.client.delete(`/schedules/${id}`, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      }).then(() => undefined);
-    },
-
-    /**
-     * Trigger a schedule immediately
-     * @param id - Schedule ID
-     * @param options - Request options
-     */
-    trigger: async (id: string, options?: { 
-      cancelToken?: CancelToken,
-      requestConfig?: AxiosRequestConfig 
-    }): Promise<RunDetails> => {
-      this.validateParams({ id }, ['id']);
-      this.logger.debug('Triggering schedule', id);
-      
-      return this.client.post(`/schedules/${id}/trigger`, undefined, {
-        cancelToken: options?.cancelToken,
-        ...options?.requestConfig
-      }).then((res: AxiosResponse) => res.data);
-    }
-  };
-
-  /**
-   * Environment Variables API
-   */
-  envVars = {
-    /**
-     * List environment variables
-     * @param params - List parameters
-     */
-    list: async (params?: {
-      limit?: number;
-      cursor?: string;
-    }) => {
-      return this.client.get('/env-vars', { params }).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Import multiple environment variables
-     * @param params - Import parameters
-     */
-    import: async (params: {
-      environmentVariables: Array<{
-        key: string;
-        value: string;
-        description?: string;
-      }>;
-    }) => {
-      return this.client.post('/env-vars/import', params).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Create a new environment variable
-     * @param params - Environment variable parameters
-     */
-    create: async (params: {
-      key: string;
-      value: string;
-      description?: string;
-    }) => {
-      validateWithZod(envVarParamsSchema, params);
-      return this.client.post('/env-vars', params).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Retrieve a specific environment variable
-     * @param envVarId - The ID of the environment variable
-     */
-    retrieve: async (envVarId: string) => {
-      return this.client.get(`/env-vars/${envVarId}`).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Update an environment variable
-     * @param envVarId - The ID of the environment variable
-     * @param params - Update parameters
-     */
-    update: async (envVarId: string, params: {
-      value?: string;
-      description?: string;
-    }) => {
-      return this.client.put(`/env-vars/${envVarId}`, params).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Delete an environment variable
-     * @param envVarId - The ID of the environment variable to delete
-     */
-    delete: async (envVarId: string) => {
-      return this.client.delete(`/env-vars/${envVarId}`).then((res: AxiosResponse) => res.data);
-    }
-  };
-
-  /**
-   * @v4 - Queues API
-   */
-  queues = {
-    /**
-     * List all queues
-     * @param params - List parameters
-     */
-    list: async (params?: {
-      limit?: number;
-      cursor?: string;
-    }) => {
-      return this.client.get('/queues', { params }).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Create a new queue
-     * @param params - Queue parameters
-     */
-    create: async (params: {
-      name: string;
-      concurrencyLimit?: number;
-      description?: string;
-    }) => {
-      validateWithZod(queueParamsSchema, params);
-      return this.client.post('/queues', params).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Get details about a queue
-     * @param queueId - The ID of the queue
-     */
-    retrieve: async (queueId: string) => {
-      return this.client.get(`/queues/${queueId}`).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Update a queue
-     * @param queueId - The ID of the queue
-     * @param params - Update parameters
-     */
-    update: async (queueId: string, params: {
-      concurrencyLimit?: number;
-      description?: string;
-    }) => {
-      return this.client.put(`/queues/${queueId}`, params).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Delete a queue
-     * @param queueId - The ID of the queue to delete
-     */
-    delete: async (queueId: string) => {
-      return this.client.delete(`/queues/${queueId}`).then((res: AxiosResponse) => res.data);
-    }
-  };
-
-  /**
-   * @v4 - Cache API - Simple key-value store for task runs
-   */
-  cache = {
-    /**
-     * Get a cached value
-     * @param key - The cache key
-     */
-    get: async (key: string) => {
-      return this.client.get(`/cache/${key}`).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Set a cached value
-     * @param key - The cache key
-     * @param value - The value to cache
-     * @param ttl - Time-to-live in seconds
-     */
-    set: async (key: string, value: any, ttl?: number) => {
-      return this.client.put(`/cache/${key}`, { value, ttl }).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Delete a cached value
-     * @param key - The cache key to delete
-     */
-    delete: async (key: string) => {
-      return this.client.delete(`/cache/${key}`).then((res: AxiosResponse) => res.data);
-    }
-  };
-
-  /**
-   * @v4 - Batch API for managing batch operations
-   */
-  batch = {
-    /**
-     * List all batches
-     * @param params - List parameters
-     */
-    list: async (params?: {
-      limit?: number;
-      cursor?: string;
-    }) => {
-      return this.client.get('/batches', { params }).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Get details about a batch
-     * @param batchId - The ID of the batch
-     */
-    retrieve: async (batchId: string) => {
-      return this.client.get(`/batches/${batchId}`).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Cancel all runs in a batch
-     * @param batchId - The ID of the batch
-     */
-    cancel: async (batchId: string) => {
-      return this.client.post(`/batches/${batchId}/cancel`).then((res: AxiosResponse) => res.data);
-    }
-  };
-
-  /**
-   * @v4 - AI tools for working with AI tasks
-   */
-  ai = {
-    /**
-     * Create a tool from a task
-     * @param params - Tool parameters
-     */
-    createTool: async (params: {
-      taskId: string;
-      description: string;
-      parameters: Record<string, any>;
-    }) => {
-      return this.client.post('/ai/tools', params).then((res: AxiosResponse) => res.data);
-    }
-  };
-
-  /**
-   * @v4 - Metadata utilities
-   */
-  metadata = {
-    /**
-     * Set metadata on the current context
-     * @param key - Metadata key
-     * @param value - Metadata value
-     */
-    set: async (key: string, value: any) => {
-      return this.client.put(`/metadata/${key}`, { value }).then((res: AxiosResponse) => res.data);
-    },
-
-    /**
-     * Get metadata from the current context
-     * @param key - Metadata key
-     */
-    get: async (key: string) => {
-      return this.client.get(`/metadata/${key}`).then((res: AxiosResponse) => res.data);
-    }
-  };
-
-  /**
-   * Helper to configure the API with a different base URL (for testing or development)
-   * @param baseURL - The custom base URL to use
-   */
-  setBaseURL(baseURL: string): void {
-    this.client.defaults.baseURL = baseURL;
-  }
-
-  /**
-   * Helper to set the WebSocket URL
-   * @param websocketURL - The custom WebSocket URL to use
-   */
-  setWebSocketURL(websocketURL: string): void {
-    this.websocketURL = websocketURL;
-  }
-
-  /**
-   * Helper to add custom headers to requests
-   * @param headers - Headers to add to requests
-   */
-  setHeaders(headers: Record<string, string>): void {
-    Object.entries(headers).forEach(([key, value]) => {
-      this.client.defaults.headers.common[key] = value;
-    });
-  }
-
-  /**
-   * @v4 - Set request timeout
-   * @param timeoutMs - Timeout in milliseconds
-   */
-  setTimeout(timeoutMs: number): void {
-    this.client.defaults.timeout = timeoutMs;
-  }
-
-  /**
-   * Clean up WebSocket resources
-   * This should be called when the API client is no longer needed
-   */
-  disposeWebSocket(): void {
-    if (this.wsManager) {
-      this.logger.debug('Disposing WebSocket connection');
-      this.wsManager.disconnect();
-      this.wsManager = null;
-    }
-  }
-
-  /**
-   * Register cleanup handlers to dispose of resources when the process exits
-   * This is useful for long-running applications to avoid resource leaks
-   * 
-   * @returns A function that can be called to remove the exit handlers
-   */
-  disposeOnExit(): () => void {
-    const exitHandler = () => {
-      this.logger.debug('Process exit detected, cleaning up resources');
-      this.disposeWebSocket();
+      return this.wsManager;
     };
     
-    // Register handlers for common exit signals
-    process.on('exit', exitHandler);
-    process.on('SIGINT', exitHandler);
-    process.on('SIGTERM', exitHandler);
-    process.on('uncaughtException', (error) => {
-      this.logger.error('Uncaught exception', error);
-      exitHandler();
-      process.exit(1);
-    });
+    // Instead of replacing the methods, create proxy methods that use the original methods
+    // This approach preserves the original methods and avoids prototype manipulation
+    const runsAPI = this.runs;
     
-    // Return a function to remove the handlers if needed
-    return () => {
-      process.removeListener('exit', exitHandler);
-      process.removeListener('SIGINT', exitHandler);
-      process.removeListener('SIGTERM', exitHandler);
-      process.removeListener('uncaughtException', exitHandler);
-    };
-  }
-
-  /**
-   * @v4 - Enable automatic retries for failed requests
-   * This will override any retry configuration from the constructor
-   * 
-   * @param options - Retry options
-   */
-  enableRetries(options: {
-    maxRetries?: number;
-    retryDelay?: number;
-    retryStatusCodes?: number[];
-    useJitter?: boolean;
-  }): void {
-    // Validate options with Zod
-    const validatedOptions = validateWithZod(retryOptionsSchema, options);
+    // Store original methods
+    const originalSubscribeToRun = runsAPI.subscribeToRun;
+    const originalSubscribeToRunsWithTag = runsAPI.subscribeToRunsWithTag;
+    const originalSubscribeToBatch = runsAPI.subscribeToBatch;
     
-    // Remove existing retry interceptors
-    const interceptors = this.client.interceptors.response as any;
-    if (interceptors.handlers) {
-      // Keep only the error handling interceptor (first one)
-      // and remove any retry interceptors
-      for (let i = interceptors.handlers.length - 1; i > 0; i--) {
-        this.client.interceptors.response.eject(i);
+    // Create a proxy object with the same methods but ensuring WebSocket manager is provided
+    const wsProxy = {
+      subscribeToRun: (runId: string, options?: { stopOnCompletion?: boolean }) => {
+        return originalSubscribeToRun.call(runsAPI, runId, options, getWsManager());
+      },
+      
+      subscribeToRunsWithTag: (tag: string | string[]) => {
+        return originalSubscribeToRunsWithTag.call(runsAPI, tag, getWsManager());
+      },
+      
+      subscribeToBatch: (batchId: string) => {
+        return originalSubscribeToBatch.call(runsAPI, batchId, getWsManager());
       }
-    }
+    };
     
-    // Configure new retry logic
-    this.configureRetryLogic({
-      maxRetries: validatedOptions.maxRetries ?? 3,
-      retryDelay: validatedOptions.retryDelay ?? 300,
-      retryStatusCodes: validatedOptions.retryStatusCodes ?? [408, 429, 500, 502, 503, 504],
-      useJitter: validatedOptions.useJitter
-    });
-    
-    this.logger.debug('Retry configuration updated', validatedOptions);
+    // Replace subscription methods with proxy methods
+    // These are instance methods, not prototype methods, so they only affect this instance
+    this.runs.subscribeToRun = wsProxy.subscribeToRun;
+    this.runs.subscribeToRunsWithTag = wsProxy.subscribeToRunsWithTag;
+    this.runs.subscribeToBatch = wsProxy.subscribeToBatch;
   }
 
   /**
    * Set up metrics collection
    */
-  private setupMetrics() {
+  private setupMetrics(): void {
     if (!this.options.metrics?.enabled) return;
     
     this.logger.debug('Request timing metrics enabled');
@@ -1414,7 +628,7 @@ export class TriggerAPI {
   /**
    * Record request metrics
    */
-  private recordMetrics(response?: AxiosResponse, error?: AxiosError) {
+  private recordMetrics(response?: AxiosResponse, error?: AxiosError): void {
     try {
       const config = response?.config || error?.config;
       if (!config) return;
@@ -1459,6 +673,115 @@ export class TriggerAPI {
     } catch (metricsError) {
       this.logger.error('Error recording metrics', metricsError);
     }
+  }
+
+  /**
+   * Helper to configure the API with a different base URL
+   */
+  setBaseURL(baseURL: string): void {
+    this.client.defaults.baseURL = baseURL;
+    this.baseURL = baseURL;
+  }
+
+  /**
+   * Helper to set the WebSocket URL
+   */
+  setWebSocketURL(websocketURL: string): void {
+    this.websocketURL = websocketURL;
+    
+    // Dispose existing WebSocket connection if there is one
+    if (this.wsManager) {
+      this.disposeWebSocket();
+    }
+  }
+
+  /**
+   * Helper to add custom headers to requests
+   */
+  setHeaders(headers: Record<string, string>): void {
+    Object.entries(headers).forEach(([key, value]) => {
+      this.client.defaults.headers.common[key] = value;
+    });
+  }
+
+  /**
+   * Set request timeout
+   */
+  setTimeout(timeoutMs: number): void {
+    this.client.defaults.timeout = timeoutMs;
+  }
+
+  /**
+   * Clean up WebSocket resources
+   */
+  disposeWebSocket(): void {
+    if (this.wsManager) {
+      this.logger.debug('Disposing WebSocket connection');
+      this.wsManager.disconnect();
+      this.wsManager = null;
+    }
+  }
+
+  /**
+   * Register cleanup handlers to dispose of resources when the process exits
+   * This is useful for long-running applications to avoid resource leaks
+   * 
+   * @returns A function that can be called to remove the exit handlers
+   */
+  disposeOnExit(): () => void {
+    const exitHandler = () => {
+      this.logger.debug('Process exit detected, cleaning up resources');
+      this.disposeWebSocket();
+    };
+    
+    // Register handlers for common exit signals
+    process.on('exit', exitHandler);
+    process.on('SIGINT', exitHandler);
+    process.on('SIGTERM', exitHandler);
+    process.on('uncaughtException', (error) => {
+      this.logger.error('Uncaught exception', error);
+      exitHandler();
+      process.exit(1);
+    });
+    
+    // Return a function to remove the handlers if needed
+    return () => {
+      process.removeListener('exit', exitHandler);
+      process.removeListener('SIGINT', exitHandler);
+      process.removeListener('SIGTERM', exitHandler);
+      process.removeListener('uncaughtException', exitHandler);
+    };
+  }
+
+  /**
+   * Enable automatic retries for failed requests
+   * This will override any retry configuration from the constructor
+   * 
+   * @param options - Retry options
+   */
+  enableRetries(options: RetryOptions): void {
+    // Validate options with Zod
+    const validatedOptions = validateWithZod(retryOptionsSchema, options);
+    
+    // Remove existing retry interceptors
+    const interceptors = this.client.interceptors.response as any;
+    if (interceptors.handlers) {
+      // Keep only the error handling interceptor (first one)
+      // and remove any retry interceptors
+      for (let i = interceptors.handlers.length - 1; i > 0; i--) {
+        this.client.interceptors.response.eject(i);
+      }
+    }
+    
+    // Configure new retry logic
+    this.configureRetryLogic({
+      maxRetries: validatedOptions.maxRetries ?? 3,
+      retryDelay: validatedOptions.retryDelay ?? 300,
+      retryStatusCodes: validatedOptions.retryStatusCodes ?? [408, 429, 500, 502, 503, 504],
+      useJitter: validatedOptions.useJitter
+    });
+    
+    this.logger.debug('Retry configuration updated', validatedOptions);
   }
   
   /**
